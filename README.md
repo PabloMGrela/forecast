@@ -52,6 +52,12 @@ python3 scripts/oceanographic_engine.py
 # Tomorrow at 7:00 UTC
 python3 scripts/oceanographic_engine.py tomorrow 7
 
+# Specific date at 9:00 UTC
+python3 scripts/oceanographic_engine.py 2026-05-01
+
+# Specific date and hour
+python3 scripts/oceanographic_engine.py 2026-05-01 14
+
 # Atmospheric forecast
 bash scripts/weather.sh
 ```

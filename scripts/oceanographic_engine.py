@@ -21,26 +21,36 @@ DEFAULT_HOUR = 9
 
 
 def parse_args():
-    """Parse arguments: [tomorrow] [HH]
+    """Parse arguments: [YYYY-MM-DD | tomorrow] [HH]
     Examples:
-        python3 oceanographic_engine.py             -> today 9:00
-        python3 oceanographic_engine.py tomorrow    -> tomorrow 9:00
-        python3 oceanographic_engine.py 14          -> today 14:00
-        python3 oceanographic_engine.py tomorrow 7  -> tomorrow 7:00
+        python3 oceanographic_engine.py                  -> today 9:00
+        python3 oceanographic_engine.py tomorrow         -> tomorrow 9:00
+        python3 oceanographic_engine.py 2026-05-01       -> 2026-05-01 9:00
+        python3 oceanographic_engine.py 2026-05-01 14    -> 2026-05-01 14:00
+        python3 oceanographic_engine.py 14               -> today 14:00
     """
-    is_tomorrow = False
+    from datetime import date as date_type
+    today = datetime.now(timezone.utc).date()
+    target_date = today
     hour = DEFAULT_HOUR
+
     for arg in sys.argv[1:]:
         if arg == "tomorrow":
-            is_tomorrow = True
+            target_date = today + timedelta(days=1)
         else:
+            try:
+                target_date = datetime.strptime(arg, "%Y-%m-%d").date()
+                continue
+            except ValueError:
+                pass
             try:
                 h = int(arg)
                 if 0 <= h <= 23:
                     hour = h
             except ValueError:
                 pass
-    return is_tomorrow, hour
+
+    return target_date, hour
 
 
 def fetch_nearest(ds_id, vars, time_start, time_end, R=0.2):
@@ -96,10 +106,9 @@ def calc_visibility(chl, effective_wave, curr_speed):
 
 
 def get_data():
-    is_tomorrow, hour = parse_args()
+    target_date, hour = parse_args()
     now = datetime.now(timezone.utc)
 
-    target_date = now.date() + timedelta(days=1 if is_tomorrow else 0)
     target = datetime(target_date.year, target_date.month, target_date.day,
                       hour, 0, 0, tzinfo=timezone.utc)
 
