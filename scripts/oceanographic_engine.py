@@ -4,16 +4,48 @@ import numpy as np
 import json
 import sys
 import math
-from datetime import datetime, timedelta, timezone
+import ssl
+import urllib.request
+import urllib.parse
 
-# Coordinates of the reference point (A Coruña coast, Galicia)
+try:
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CTX = ssl.create_default_context()
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Default coordinates of the reference point (A Coruña coast, Galicia).
+# Overridden when a `site=<id>` CLI arg matches an entry in dive_sites.json.
 LAT, LON = 43.382167, -8.389000
+
+# Compass bearing (degrees, 0=N, clockwise) for the exposure strings in dive_sites.json.
+COMPASS_DEG = {
+    "N":   0, "NNE":  22.5, "NE":  45, "ENE":  67.5,
+    "E":  90, "ESE": 112.5, "SE": 135, "SSE": 157.5,
+    "S": 180, "SSW": 202.5, "SW": 225, "WSW": 247.5,
+    "W": 270, "WNW": 292.5, "NW": 315, "NNW": 337.5,
+}
+
+# Residual-energy multipliers for each site's shelter class. Head-on swell still
+# reaches the site at shelter_max; fully oblique swell is attenuated to shelter_min
+# (diffraction around headlands means some energy always arrives).
+SHELTER_CLASS = {
+    "exposed":        {"min": 0.15, "max": 1.00},
+    "semi-sheltered": {"min": 0.05, "max": 0.60},
+    "sheltered":      {"min": 0.02, "max": 0.30},
+}
 
 # Copernicus Marine IBI datasets
 DS_WAV   = "cmems_mod_ibi_wav_anfc_0.027deg_PT1H-i"
 DS_PHY   = "cmems_mod_ibi_phy_anfc_0.027deg-3D_PT1H-m"
 DS_BGC   = "cmems_mod_ibi_bgc_anfc_0.027deg-3D_P1D-m"
+DS_OPT   = "cmems_mod_ibi_bgc-optics_anfc_0.027deg_P1D-m"
 DS_TIDE  = "cmems_mod_ibi_phy_anfc_0.027deg-2D_PT15M-i"
+# Ocean-colour observations — preferred over model optics when available.
+# L4 gap-free multisensor 4 km daily product, global coverage.
+DS_SAT_KD = "cmems_obs-oc_glo_bgc-transp_nrt_l4-gapfree-multi-4km_P1D"
 
 # Visibility / physics constants
 SECCHI_COEFF      = 1.7      # Poole-Atkins coefficient
@@ -26,37 +58,91 @@ GRAVITY           = 9.81     # m/s²
 UB_ALPHA          = 0.3      # kd per (m/s) above threshold
 UB_THRESHOLD      = 0.15     # m/s — orbital velocity threshold for resuspension
 
+# Runoff / atmospheric constants
+RAIN_LOOKBACK_H   = 72       # hours of precipitation accumulated ahead of target
+RAIN_KD_COEFF     = 0.008    # kd per mm·exp(-age/tau) of recent rain
+RAIN_TAU_H        = 36       # exponential decay half-life of runoff effect
+
+# Wind-driven surface mixing: extra kd in the top layer, attenuated with depth
+WIND_KD_COEFF     = 0.02     # kd per (m/s) over threshold
+WIND_THRESHOLD_MS = 3.0      # m/s below which wind effect is negligible
+WIND_DEPTH_SCALE  = 5.0      # metres — e-folding depth of surface mixing
+
 
 def parse_args():
-    """Parse arguments: [YYYY-MM-DD | tomorrow] [HH]
+    """Parse arguments: [YYYY-MM-DD | tomorrow] [HH] [site=<id>]
     Examples:
-        python3 oceanographic_engine.py                  -> today 9:00
-        python3 oceanographic_engine.py tomorrow         -> tomorrow 9:00
-        python3 oceanographic_engine.py 2026-05-01       -> 2026-05-01 9:00
-        python3 oceanographic_engine.py 2026-05-01 14    -> 2026-05-01 14:00
-        python3 oceanographic_engine.py 14               -> today 14:00
+        python3 oceanographic_engine.py                          -> today 9:00, default point
+        python3 oceanographic_engine.py 2026-05-01 14 site=el_grelle
     """
     today = datetime.now(timezone.utc).date()
     target_date = today
     hour = DEFAULT_HOUR
+    site_id = None
 
     for arg in sys.argv[1:]:
         if arg == "tomorrow":
             target_date = today + timedelta(days=1)
-        else:
-            try:
-                target_date = datetime.strptime(arg, "%Y-%m-%d").date()
-                continue
-            except ValueError:
-                pass
-            try:
-                h = int(arg)
-                if 0 <= h <= 23:
-                    hour = h
-            except ValueError:
-                pass
+            continue
+        if arg.startswith("site="):
+            site_id = arg.split("=", 1)[1].strip() or None
+            continue
+        try:
+            target_date = datetime.strptime(arg, "%Y-%m-%d").date()
+            continue
+        except ValueError:
+            pass
+        try:
+            h = int(arg)
+            if 0 <= h <= 23:
+                hour = h
+        except ValueError:
+            pass
 
-    return target_date, hour
+    return target_date, hour, site_id
+
+
+def load_site(site_id):
+    """Load a site definition from dive_sites.json. Returns None if not found."""
+    if not site_id:
+        return None
+    sites_file = Path(__file__).parent / "dive_sites.json"
+    try:
+        with open(sites_file) as f:
+            sites = json.load(f).get("sites", [])
+    except FileNotFoundError:
+        return None
+    for s in sites:
+        if s.get("id") == site_id:
+            return s
+    return None
+
+
+def _angular_diff(a, b):
+    """Smallest angular difference between two bearings in degrees [0, 180]."""
+    d = abs((a - b) % 360)
+    return d if d <= 180 else 360 - d
+
+
+def site_shelter_factor(wave_dir, site):
+    """Fraction of open-water wave height that actually reaches the site.
+
+    Combines two effects:
+      - Geometric: cos²(diff/2), which stays near 1 for small off-angles and
+        drops sharply past 90°, matching how a headland shelters a site.
+      - Shelter class: residual energy bounds from SHELTER_CLASS, which encode
+        that even perfectly-sheltered sites still see some swell via diffraction.
+    """
+    if not site or wave_dir is None:
+        return 1.0
+    exp = site.get("exposure")
+    if exp not in COMPASS_DEG:
+        return 1.0
+    diff = _angular_diff(wave_dir, COMPASS_DEG[exp])   # 0..180
+    alignment = math.cos(math.radians(diff / 2.0)) ** 2  # 1 head-on → 0 opposite
+    bounds = SHELTER_CLASS.get(site.get("shelter", "exposed"),
+                               SHELTER_CLASS["exposed"])
+    return bounds["min"] + (bounds["max"] - bounds["min"]) * alignment
 
 
 def fetch_nearest(ds_id, vars, time_start, time_end, R=0.2):
@@ -73,8 +159,122 @@ def fetch_nearest(ds_id, vars, time_start, time_end, R=0.2):
             return pd.DataFrame()
         df['dist'] = (df['latitude'] - LAT)**2 + (df['longitude'] - LON)**2
         return df
-    except:
+    except Exception as e:
+        print(f"[fetch_nearest] {ds_id} vars={vars}: {type(e).__name__}: {e}",
+              file=sys.stderr)
         return pd.DataFrame()
+
+
+def fetch_satellite_kd(target, lat=None, lon=None, R=0.1):
+    """Return (kd_effective, source_date, zsd_m) observed by satellite for target.
+
+    Uses the Copernicus L4 gap-free multisensor transparency product (~4 km).
+    Prefers the ZSD (Secchi disk depth) variable, which for Case-2 coastal
+    waters is more faithful to real in-water optics than the spectral KD490.
+    An effective kd is derived via kd = SECCHI_COEFF / ZSD so the rest of the
+    pipeline stays consistent with the Poole-Atkins formula.
+
+    The product lags by ~2 days behind real-time, so for future or too-recent
+    targets this returns (None, None, None). Matches only the exact target
+    date to avoid silently injecting stale data.
+    """
+    ref_lat = LAT if lat is None else lat
+    ref_lon = LON if lon is None else lon
+    try:
+        df = copernicusmarine.read_dataframe(
+            dataset_id=DS_SAT_KD, variables=["KD490", "ZSD"],
+            minimum_longitude=ref_lon - R, maximum_longitude=ref_lon + R,
+            minimum_latitude=ref_lat - R,  maximum_latitude=ref_lat + R,
+            start_datetime=(target - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+            end_datetime  =(target + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+        ).reset_index()
+    except Exception as e:
+        print(f"[fetch_satellite_kd] {DS_SAT_KD}: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None, None, None
+    if df.empty:
+        return None, None, None
+    target_day = target.astimezone(timezone.utc).date()
+    df["obs_day"] = pd.to_datetime(df["time"]).dt.date
+    same_day = df[df["obs_day"] == target_day].dropna(subset=["ZSD"])
+    if same_day.empty:
+        return None, None, None
+    same_day = same_day.assign(
+        dist=(same_day["latitude"] - ref_lat) ** 2 + (same_day["longitude"] - ref_lon) ** 2
+    )
+    row = same_day.sort_values("dist").iloc[0]
+    zsd = float(row["ZSD"])
+    if zsd <= 0:
+        return None, None, None
+    kd_eff = SECCHI_COEFF / zsd
+    return kd_eff, target_day.isoformat(), zsd
+
+
+def fetch_open_meteo(target, lat=None, lon=None):
+    """Return dict with 72h accumulated precipitation (mm, exp-decay weighted)
+    and hourly wind speed / direction at target hour.
+
+    Uses Open-Meteo free API (no auth). Returns None on failure.
+    """
+    ref_lat = LAT if lat is None else lat
+    ref_lon = LON if lon is None else lon
+    target_utc = target.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    start = (target_utc - timedelta(hours=RAIN_LOOKBACK_H))
+    end   = target_utc
+    params = {
+        "latitude":  f"{ref_lat:.4f}",
+        "longitude": f"{ref_lon:.4f}",
+        "hourly":    "precipitation,wind_speed_10m,wind_direction_10m",
+        "timezone":  "UTC",
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date":   end.strftime("%Y-%m-%d"),
+        "wind_speed_unit": "ms",
+    }
+    url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, timeout=15, context=_SSL_CTX) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        print(f"[fetch_open_meteo] {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+    h = data.get("hourly", {})
+    times = h.get("time", [])
+    if not times:
+        return None
+    precip = h.get("precipitation") or []
+    wspd   = h.get("wind_speed_10m") or []
+    wdir   = h.get("wind_direction_10m") or []
+
+    # Exponentially-decayed rain accumulation relative to target hour
+    accum = 0.0
+    for t_str, p in zip(times, precip):
+        if p is None:
+            continue
+        t = datetime.fromisoformat(t_str).replace(tzinfo=timezone.utc)
+        age_h = (target_utc - t).total_seconds() / 3600.0
+        if age_h < 0 or age_h > RAIN_LOOKBACK_H:
+            continue
+        accum += p * math.exp(-age_h / RAIN_TAU_H)
+
+    # Wind at target hour (fall back to any available value in ±2h window)
+    target_str = target_utc.strftime("%Y-%m-%dT%H:00")
+    wind_speed = wind_dir = None
+    try:
+        idx = times.index(target_str)
+        if idx < len(wspd) and wspd[idx] is not None:
+            wind_speed = float(wspd[idx])
+        if idx < len(wdir) and wdir[idx] is not None:
+            wind_dir = float(wdir[idx])
+    except ValueError:
+        pass
+
+    return {
+        "rain_accum_mm":   float(accum),
+        "wind_speed_ms":   wind_speed,
+        "wind_dir_deg":    wind_dir,
+        "rain_window_h":   RAIN_LOOKBACK_H,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -143,38 +343,66 @@ def calc_bottom_orbital_velocity(H_ww, T_ww, depth=DEFAULT_DEPTH):
 # Improved visibility model
 # ---------------------------------------------------------------------------
 
+class MissingBGCDataError(RuntimeError):
+    """Raised when the Copernicus BGC/optics data needed for visibility is absent."""
+
+
 def calc_visibility(kd_copernicus, H_ww, T_ww, salinity,
-                    depth=DEFAULT_DEPTH, chl=None):
+                    depth=DEFAULT_DEPTH,
+                    H_sw=0.0, T_sw=0.0, H_eff=None,
+                    rain_accum_mm=0.0, wind_speed_ms=None):
     """Multi-factor underwater visibility model for Case 2 coastal waters.
 
-    Priority:
-      1. Use Copernicus kd (BGC) as the baseline when available.
-      2. Add sediment resuspension from wind-wave bottom orbital velocity.
-      3. Add freshwater-runoff penalty from salinity.
+    Requires a Copernicus kd baseline (satellite or model). Adds:
+      - Sediment resuspension from bottom orbital velocity of both wind-wave
+        and swell components, scaled by H_eff/H_inst to carry yesterday's
+        storm into today's kd.
+      - Freshwater-runoff penalty driven by salinity anomaly.
+      - Recent-rain runoff penalty (Open-Meteo precipitation accumulation).
+      - Wind-driven surface mixing, attenuated with depth.
 
-    Falls back to a bio-optical estimate from chlorophyll if kd is missing.
+    Raises `MissingBGCDataError` if kd is unavailable; no fallback is applied
+    because that would hide missing data as a plausible number.
     """
-    # --- Baseline kd ---
-    if kd_copernicus is not None and kd_copernicus > 0:
-        kd_base = float(kd_copernicus)
-    else:
-        # Bio-optical fallback (Lee et al. / Morel)
-        c = max(chl, 0.01) if chl is not None else 0.1
-        kd_base = 0.12 + 0.0166 + 0.0773 * c**0.6715
+    if kd_copernicus is None or not (kd_copernicus > 0):
+        raise MissingBGCDataError(
+            "kd baseline (satellite or Copernicus optics) unavailable — cannot compute visibility"
+        )
+    kd_base = float(kd_copernicus)
 
-    # --- Sediment resuspension from wind waves ---
-    U_b = calc_bottom_orbital_velocity(H_ww, T_ww, depth)
+    # --- Sediment resuspension: use the stronger of wind-wave and swell ---
+    U_b_ww = calc_bottom_orbital_velocity(H_ww, T_ww, depth)
+    U_b_sw = calc_bottom_orbital_velocity(H_sw, T_sw, depth)
+    U_b    = max(U_b_ww, U_b_sw)
+
+    # --- Carry-over of previously resuspended sediment (24h half-life) ---
+    H_inst = max(H_ww, H_sw)
+    if H_eff is not None and H_inst > 0 and H_eff > H_inst:
+        U_b *= H_eff / H_inst
+
     kd_sediment = UB_ALPHA * max(0.0, U_b - UB_THRESHOLD)
 
-    # --- Runoff / freshwater penalty ---
+    # --- Salinity-driven runoff penalty ---
     if salinity is not None and salinity < 34.5:
-        kd_runoff = min(1.0, 0.15 * (35.5 - salinity))
+        kd_runoff_sal = min(1.0, 0.15 * (35.5 - salinity))
     else:
-        kd_runoff = 0.0
+        kd_runoff_sal = 0.0
 
-    kd_total = kd_base + kd_sediment + kd_runoff
+    # --- Recent-rain runoff penalty (exp-decay weighted mm over 72h) ---
+    kd_runoff_rain = RAIN_KD_COEFF * max(0.0, float(rain_accum_mm or 0.0))
+
+    # --- Wind-driven surface mixing, attenuated with depth ---
+    if wind_speed_ms is not None and wind_speed_ms > WIND_THRESHOLD_MS:
+        kd_wind = (WIND_KD_COEFF * (wind_speed_ms - WIND_THRESHOLD_MS)
+                   * math.exp(-max(depth, 0.0) / WIND_DEPTH_SCALE))
+    else:
+        kd_wind = 0.0
+
+    kd_runoff = kd_runoff_sal + kd_runoff_rain
+    kd_total  = kd_base + kd_sediment + kd_runoff + kd_wind
     vis = SECCHI_COEFF / max(kd_total, 0.01)
-    return round(max(0.5, min(vis, 15.0)), 1), kd_base, kd_sediment, kd_runoff
+    return (round(max(0.5, min(vis, 15.0)), 1),
+            kd_base, kd_sediment, kd_runoff, kd_wind)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +590,8 @@ def _scalar(row, col, default=0.0):
     return float(v) if v is not None and not (isinstance(v, float) and math.isnan(v)) else default
 
 
-def extract_point(wave_df, phy_df, bgc_df, target, depth=DEFAULT_DEPTH):
+def extract_point(wave_df, phy_df, bgc_df, target, depth=DEFAULT_DEPTH, opt_df=None,
+                  site=None, sat_kd=None, meteo=None):
     """Extract all variables at a single target datetime and compute scores.
 
     Returns a dict with all telemetry, scores and metadata.
@@ -421,16 +650,42 @@ def extract_point(wave_df, phy_df, bgc_df, target, depth=DEFAULT_DEPTH):
         chl_raw = b.get('chl')
         if chl_raw is not None and not (isinstance(chl_raw, float) and math.isnan(chl_raw)):
             chl = float(chl_raw)
-        kd_raw = b.get('kd')
-        if kd_raw is not None and not (isinstance(kd_raw, float) and math.isnan(kd_raw)):
-            kd_cop = float(kd_raw)
         zeu_raw = b.get('zeu')
         if zeu_raw is not None and not (isinstance(zeu_raw, float) and math.isnan(zeu_raw)):
             zeu = float(zeu_raw)
 
+    if opt_df is not None and not opt_df.empty:
+        o = opt_df.copy()
+        o["time_dist"] = abs(
+            (o["time"] - target.replace(tzinfo=None)).dt.total_seconds()
+        )
+        if 'depth' in o.columns:
+            o['depth_dist'] = (o['depth'] - depth).abs()
+            sort_cols = ['time_dist', 'depth_dist', 'dist']
+        else:
+            sort_cols = ['time_dist', 'dist']
+        kd_raw = o.sort_values(sort_cols).iloc[0].get('kd')
+        if kd_raw is not None and not (isinstance(kd_raw, float) and math.isnan(kd_raw)):
+            kd_cop = float(kd_raw)
+
+    # --- Site sheltering: attenuate swell reaching this specific site ---
+    shelter = site_shelter_factor(d, site)  # 1.0 when no site is specified
+    H_ww_site  = H_ww  * shelter
+    H_sw_site  = swell_h * shelter
+    H_eff_site = effective_wave * shelter
+
+    # --- kd baseline: prefer satellite observation over model when available ---
+    kd_baseline = sat_kd if sat_kd is not None else kd_cop
+
+    # --- Atmospheric inputs ---
+    rain_mm    = (meteo or {}).get("rain_accum_mm") or 0.0
+    wind_speed = (meteo or {}).get("wind_speed_ms")
+
     # --- Visibility ---
-    vis, kd_base, kd_sed, kd_run = calc_visibility(
-        kd_cop, H_ww, T_ww, salinity, depth=depth, chl=chl
+    vis, kd_base, kd_sed, kd_run, kd_wnd = calc_visibility(
+        kd_baseline, H_ww_site, T_ww, salinity, depth=depth,
+        H_sw=H_sw_site, T_sw=swell_per, H_eff=H_eff_site,
+        rain_accum_mm=rain_mm, wind_speed_ms=wind_speed,
     )
 
     # --- Scores ---
@@ -455,13 +710,19 @@ def extract_point(wave_df, phy_df, bgc_df, target, depth=DEFAULT_DEPTH):
         "effective_wave": effective_wave,
         # derived
         "vis": vis,
-        "kd_base": kd_base, "kd_sed": kd_sed, "kd_run": kd_run,
+        "kd_base": kd_base, "kd_sed": kd_sed, "kd_run": kd_run, "kd_wnd": kd_wnd,
+        "kd_source": "satellite" if sat_kd is not None else ("model" if kd_cop is not None else None),
         # scores
         "dive_score": dive_score,
         "vis_factor": vis_factor, "temp_factor": temp_factor,
         "curr_factor": curr_factor, "wave_factor": wave_factor,
         "sal_factor": sal_factor,
         "surf_score": surf_score,
+        # site sheltering
+        "site_shelter_factor": shelter,
+        # atmospheric inputs (may be None when unavailable)
+        "rain_accum_mm": rain_mm,
+        "wind_speed_ms": wind_speed,
     }
 
 
@@ -485,7 +746,18 @@ def calc_trend(score_now, score_3h, score_6h):
 # ---------------------------------------------------------------------------
 
 def get_data():
-    target_date, hour = parse_args()
+    global LAT, LON
+
+    target_date, hour, site_id = parse_args()
+    site = load_site(site_id)
+    if site_id and site is None:
+        print(f"[oceanographic_engine] unknown site id: {site_id!r}", file=sys.stderr)
+        sys.exit(2)
+    if site:
+        LAT, LON = site["lat"], site["lon"]
+        site_depth = float(site.get("depth_m", DEFAULT_DEPTH))
+    else:
+        site_depth = DEFAULT_DEPTH
 
     target = datetime(
         target_date.year, target_date.month, target_date.day,
@@ -513,11 +785,18 @@ def get_data():
     )
 
     # -----------------------------------------------------------------------
-    # Fetch BGC data: daily, small window around target
+    # Fetch BGC data: daily, small window around target.
+    # `kd` lives in the separate optics dataset; chl and zeu are in the BGC one.
     # -----------------------------------------------------------------------
     bgc_df = fetch_nearest(
         DS_BGC,
-        ["chl", "kd", "zeu"],
+        ["chl", "zeu"],
+        target - timedelta(hours=24),
+        target + timedelta(hours=24)
+    )
+    opt_df = fetch_nearest(
+        DS_OPT,
+        ["kd"],
         target - timedelta(hours=24),
         target + timedelta(hours=24)
     )
@@ -533,11 +812,38 @@ def get_data():
     )
 
     # -----------------------------------------------------------------------
+    # Observational / atmospheric augmentations (best-effort, never raise)
+    # -----------------------------------------------------------------------
+    sat_kd, sat_kd_date, sat_zsd = fetch_satellite_kd(target)
+    meteo = fetch_open_meteo(target)
+
+    # -----------------------------------------------------------------------
     # Extract point data at target, target+3h, target+6h
     # -----------------------------------------------------------------------
-    pt_now = extract_point(wave_df, phy_df, bgc_df, target)
-    pt_3h  = extract_point(wave_df, phy_df, bgc_df, target + timedelta(hours=3))
-    pt_6h  = extract_point(wave_df, phy_df, bgc_df, target + timedelta(hours=6))
+    try:
+        pt_now = extract_point(wave_df, phy_df, bgc_df, target, opt_df=opt_df,
+                               depth=site_depth, site=site,
+                               sat_kd=sat_kd, meteo=meteo)
+        pt_3h  = extract_point(wave_df, phy_df, bgc_df, target + timedelta(hours=3),
+                               opt_df=opt_df, depth=site_depth, site=site,
+                               sat_kd=sat_kd, meteo=meteo)
+        pt_6h  = extract_point(wave_df, phy_df, bgc_df, target + timedelta(hours=6),
+                               opt_df=opt_df, depth=site_depth, site=site,
+                               sat_kd=sat_kd, meteo=meteo)
+    except MissingBGCDataError as e:
+        err = {
+            "error": "missing_bgc_data",
+            "message": str(e),
+            "target":  target.strftime("%Y-%m-%d %H:%M UTC"),
+            "location": {"lat": LAT, "lon": LON},
+            "hint": (
+                "Copernicus IBI BGC/optics datasets are updated weekly (Thursdays). "
+                "Requested date is likely beyond the current forecast horizon."
+            ),
+        }
+        print(json.dumps(err, indent=2))
+        print(f"[oceanographic_engine] {err['message']}", file=sys.stderr)
+        sys.exit(2)
 
     trend = calc_trend(pt_now['dive_score'], pt_3h['dive_score'], pt_6h['dive_score'])
 
@@ -577,7 +883,19 @@ def get_data():
         "current_dir_deg":      round(pt_now['curr_dir'], 1),
         "effective_wave_m":     round(pt_now['effective_wave'], 2),
         "kd_copernicus":        round(pt_now['kd_cop'], 4) if pt_now['kd_cop'] is not None else None,
+        "kd_satellite":         round(sat_kd, 4) if sat_kd is not None else None,
+        "secchi_satellite_m":   round(sat_zsd, 1) if sat_zsd is not None else None,
+        "kd_source":            pt_now['kd_source'],
+        "sat_observation_date": sat_kd_date,
         "euphotic_depth_m":     round(pt_now['zeu'], 1) if pt_now['zeu'] is not None else None,
+        "rain_prev_72h_mm":     round(pt_now['rain_accum_mm'], 2),
+        "wind_speed_ms":        round(pt_now['wind_speed_ms'], 2) if pt_now['wind_speed_ms'] is not None else None,
+        "kd_components": {
+            "baseline": round(pt_now['kd_base'], 4),
+            "sediment": round(pt_now['kd_sed'],  4),
+            "runoff":   round(pt_now['kd_run'],  4),
+            "wind":     round(pt_now['kd_wnd'],  4),
+        },
     }
 
     # Backward-compat alias kept from original output
@@ -611,6 +929,15 @@ def get_data():
         "trend": trend,
         "safety_alerts": alerts,
     }
+    if site:
+        res["site"] = {
+            "id":        site["id"],
+            "name":      site["name"],
+            "exposure":  site.get("exposure"),
+            "shelter":   site.get("shelter"),
+            "depth_m":   site_depth,
+            "shelter_factor": round(pt_now["site_shelter_factor"], 3),
+        }
 
     print(json.dumps(res, indent=2))
 
